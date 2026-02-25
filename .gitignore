@@ -1,0 +1,21 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Secret files
+.secret
+.secret.*
+secret
+secret.*
+secrets
+secrets.*
+secrete
+secrete.*
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/

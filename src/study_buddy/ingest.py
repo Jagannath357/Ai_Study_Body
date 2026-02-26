@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,12 @@ from study_buddy.vectorstore import (
 
 FREE_TIER_BATCH_SIZE = 2
 FREE_TIER_SLEEP_SECONDS = 10
+
+
+@dataclass(frozen=True)
+class UploadedPDF:
+    name: str
+    data: bytes
 
 
 def split_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
@@ -49,6 +57,10 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: f.read(65536), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def _load_manifest(path: Path) -> dict[str, Any]:
@@ -81,6 +93,15 @@ def _read_pdf_pages(pdf_path: Path) -> list[tuple[int, str]]:
     return pages
 
 
+def _read_pdf_pages_from_bytes(pdf_bytes: bytes) -> list[tuple[int, str]]:
+    reader = PdfReader(BytesIO(pdf_bytes))
+    pages: list[tuple[int, str]] = []
+    for idx, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        pages.append((idx, text))
+    return pages
+
+
 def _discover_pdfs(data_dir: Path) -> list[Path]:
     if not data_dir.exists():
         return []
@@ -97,7 +118,28 @@ def _add_documents_throttled(store: Any, docs: list[Document], ids: list[str]) -
             time.sleep(FREE_TIER_SLEEP_SECONDS)
 
 
-def run_ingestion(settings: Settings, reset: bool = False) -> IngestStats:
+def _normalize_uploaded_pdfs(uploaded_pdfs: list[UploadedPDF]) -> list[UploadedPDF]:
+    seen: dict[str, int] = {}
+    normalized: list[UploadedPDF] = []
+    for uploaded in uploaded_pdfs:
+        raw_name = Path(uploaded.name).name.strip() or "uploaded.pdf"
+        count = seen.get(raw_name, 0) + 1
+        seen[raw_name] = count
+        if count == 1:
+            normalized_name = raw_name
+        else:
+            suffix = Path(raw_name).suffix
+            stem = Path(raw_name).stem or "uploaded"
+            normalized_name = f"{stem}_{count}{suffix}"
+        normalized.append(UploadedPDF(name=normalized_name, data=uploaded.data))
+    return normalized
+
+
+def run_ingestion(
+    settings: Settings,
+    reset: bool = False,
+    uploaded_pdfs: list[UploadedPDF] | None = None,
+) -> IngestStats:
     started = time.perf_counter()
     stats = IngestStats()
 
@@ -116,72 +158,133 @@ def run_ingestion(settings: Settings, reset: bool = False) -> IngestStats:
     store = get_vectorstore(settings, embeddings=embeddings)
     known_files: dict[str, Any] = manifest.setdefault("files", {})
 
-    pdf_paths = _discover_pdfs(settings.data_dir)
-    stats.files_seen = len(pdf_paths)
-    current_rel_paths = {p.relative_to(settings.data_dir).as_posix() for p in pdf_paths}
+    if uploaded_pdfs is None:
+        pdf_paths = _discover_pdfs(settings.data_dir)
+        stats.files_seen = len(pdf_paths)
+        current_rel_paths = {p.relative_to(settings.data_dir).as_posix() for p in pdf_paths}
 
-    for stale_rel_path in list(known_files.keys()):
-        if stale_rel_path in current_rel_paths:
-            continue
-        stale = known_files.get(stale_rel_path, {})
-        stale_ids = stale.get("chunk_ids", [])
-        if stale_ids:
-            store.delete(ids=stale_ids)
-        del known_files[stale_rel_path]
-
-    for pdf_path in pdf_paths:
-        rel_path = pdf_path.relative_to(settings.data_dir).as_posix()
-        try:
-            file_hash = _sha256(pdf_path)
-            previous = known_files.get(rel_path)
-            if previous and previous.get("file_hash") == file_hash:
+        for stale_rel_path in list(known_files.keys()):
+            if stale_rel_path.startswith("upload::"):
                 continue
+            if stale_rel_path in current_rel_paths:
+                continue
+            stale = known_files.get(stale_rel_path, {})
+            stale_ids = stale.get("chunk_ids", [])
+            if stale_ids:
+                store.delete(ids=stale_ids)
+            del known_files[stale_rel_path]
 
-            if previous and previous.get("chunk_ids"):
-                store.delete(ids=previous["chunk_ids"])
+        for pdf_path in pdf_paths:
+            rel_path = pdf_path.relative_to(settings.data_dir).as_posix()
+            try:
+                file_hash = _sha256(pdf_path)
+                previous = known_files.get(rel_path)
+                if previous and previous.get("file_hash") == file_hash:
+                    continue
 
-            ingested_at = datetime.now(UTC).isoformat()
-            docs: list[Document] = []
-            ids: list[str] = []
-            for page_number, page_text in _read_pdf_pages(pdf_path):
-                chunks = split_text(
-                    text=page_text,
-                    chunk_size=settings.chunk_size,
-                    chunk_overlap=settings.chunk_overlap,
-                )
-                for chunk_index, chunk in enumerate(chunks):
-                    doc_id = f"{file_hash}:{page_number}:{chunk_index}"
-                    ids.append(doc_id)
-                    docs.append(
-                        Document(
-                            page_content=chunk,
-                            metadata={
-                                "doc_id": doc_id,
-                                "source_file": rel_path,
-                                "page": page_number,
-                                "chunk_index": chunk_index,
-                                "file_hash": file_hash,
-                                "ingested_at": ingested_at,
-                            },
-                        )
+                if previous and previous.get("chunk_ids"):
+                    store.delete(ids=previous["chunk_ids"])
+
+                ingested_at = datetime.now(UTC).isoformat()
+                docs: list[Document] = []
+                ids: list[str] = []
+                for page_number, page_text in _read_pdf_pages(pdf_path):
+                    chunks = split_text(
+                        text=page_text,
+                        chunk_size=settings.chunk_size,
+                        chunk_overlap=settings.chunk_overlap,
                     )
+                    for chunk_index, chunk in enumerate(chunks):
+                        doc_id = f"{file_hash}:{page_number}:{chunk_index}"
+                        ids.append(doc_id)
+                        docs.append(
+                            Document(
+                                page_content=chunk,
+                                metadata={
+                                    "doc_id": doc_id,
+                                    "source_file": rel_path,
+                                    "page": page_number,
+                                    "chunk_index": chunk_index,
+                                    "file_hash": file_hash,
+                                    "ingested_at": ingested_at,
+                                },
+                            )
+                        )
 
-            if docs:
-                _add_documents_throttled(store=store, docs=docs, ids=ids)
+                if docs:
+                    _add_documents_throttled(store=store, docs=docs, ids=ids)
 
-            known_files[rel_path] = {
-                "file_hash": file_hash,
-                "chunk_ids": ids,
-                "updated_at": ingested_at,
-                "num_chunks": len(ids),
-            }
-            stats.files_indexed += 1
-            if previous is None:
-                stats.chunks_added += len(ids)
-            else:
-                stats.chunks_updated += len(ids)
-        except Exception as exc:  # noqa: BLE001
-            stats.errors.append(f"{rel_path}: {exc}")
+                known_files[rel_path] = {
+                    "file_hash": file_hash,
+                    "chunk_ids": ids,
+                    "updated_at": ingested_at,
+                    "num_chunks": len(ids),
+                }
+                stats.files_indexed += 1
+                if previous is None:
+                    stats.chunks_added += len(ids)
+                else:
+                    stats.chunks_updated += len(ids)
+            except Exception as exc:  # noqa: BLE001
+                stats.errors.append(f"{rel_path}: {exc}")
+    else:
+        normalized_uploads = _normalize_uploaded_pdfs(uploaded_pdfs)
+        stats.files_seen = len(normalized_uploads)
+
+        for uploaded in normalized_uploads:
+            source_name = uploaded.name
+            manifest_key = f"upload::{source_name}"
+            try:
+                file_hash = _sha256_bytes(uploaded.data)
+                previous = known_files.get(manifest_key)
+                if previous and previous.get("file_hash") == file_hash:
+                    continue
+
+                if previous and previous.get("chunk_ids"):
+                    store.delete(ids=previous["chunk_ids"])
+
+                ingested_at = datetime.now(UTC).isoformat()
+                docs: list[Document] = []
+                ids: list[str] = []
+                for page_number, page_text in _read_pdf_pages_from_bytes(uploaded.data):
+                    chunks = split_text(
+                        text=page_text,
+                        chunk_size=settings.chunk_size,
+                        chunk_overlap=settings.chunk_overlap,
+                    )
+                    for chunk_index, chunk in enumerate(chunks):
+                        doc_id = f"{file_hash}:{page_number}:{chunk_index}"
+                        ids.append(doc_id)
+                        docs.append(
+                            Document(
+                                page_content=chunk,
+                                metadata={
+                                    "doc_id": doc_id,
+                                    "source_file": source_name,
+                                    "page": page_number,
+                                    "chunk_index": chunk_index,
+                                    "file_hash": file_hash,
+                                    "ingested_at": ingested_at,
+                                },
+                            )
+                        )
+
+                if docs:
+                    _add_documents_throttled(store=store, docs=docs, ids=ids)
+
+                known_files[manifest_key] = {
+                    "file_hash": file_hash,
+                    "chunk_ids": ids,
+                    "updated_at": ingested_at,
+                    "num_chunks": len(ids),
+                }
+                stats.files_indexed += 1
+                if previous is None:
+                    stats.chunks_added += len(ids)
+                else:
+                    stats.chunks_updated += len(ids)
+            except Exception as exc:  # noqa: BLE001
+                stats.errors.append(f"{source_name}: {exc}")
 
     _save_manifest(m_path, manifest)
     stats.duration_s = round(time.perf_counter() - started, 3)

@@ -1,0 +1,8 @@
+langchain>=0.3.0
+langchain-google-genai>=2.0.0
+langchain-chroma>=0.2.0
+chromadb>=0.5.0
+pypdf>=5.0.0
+python-dotenv>=1.0.1
+streamlit>=1.40.0
+typer>=0.12.5
